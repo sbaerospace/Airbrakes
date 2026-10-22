@@ -19,15 +19,35 @@ constexpr double MASS_KG = 0.650;          // placeholder: constant coast mass
 constexpr double AREA_M2 = 0.00385;       // fixed reference area (~70 mm diameter)
 constexpr double BASE_CD = 0.50;          // placeholder, brakes retracted
 // EXTRA effective Cd from brakes, all using AREA_M2 above. NOT measured data.
-// Index 0 = retracted; index 9 = maximum extension. Total Cd = BASE_CD + entry.
-constexpr std::array<double, 10> BRAKE_CD =
+// First entry = retracted; last entry = maximum extension. Total Cd = BASE_CD + entry.
+// Edit just this list to change the number of equally spaced commanded positions.
+// C++17 deduces its size; use decimal values (e.g. {0.00, 2.00} for two settings).
+constexpr std::array BRAKE_CD =
     {0.00, 0.08, 0.18, 0.32, 0.50, 0.72, 0.98, 1.28, 1.62, 2.00};
 constexpr double K = 0.20;                 // settings per metre of apogee error
 constexpr double INITIAL_IMPULSE_NS = 66.0;// ideal instantaneous NET momentum impulse
 constexpr double INITIAL_HEIGHT_M = 0.0;
 constexpr double PREDICTOR_RHO = 1.225;    // held CONSTANT in analytical predictor
 constexpr double CONTROL_PERIOD_S = 0.25; // 4 Hz: choose a new command every 0.25 s
-constexpr double SERVO_LEVELS_PER_S = 18.0;// 0 to 9 takes 0.5 s
+constexpr double SERVO_FULL_TRAVEL_S = 0.50; // physical time from closed to fully open
+constexpr int MAX_BRAKE_INDEX = static_cast<int>(BRAKE_CD.size()) - 1;
+constexpr double SERVO_LEVELS_PER_S = MAX_BRAKE_INDEX / SERVO_FULL_TRAVEL_S;
+
+// Catch malformed coefficient tables at compilation, before indexing them.
+constexpr bool validBrakeTable() {
+    if (BRAKE_CD.size()<2 || BRAKE_CD.front()!=0.0) return false;
+    for (std::size_t i=0;i<BRAKE_CD.size();++i) {
+        const double cd=BRAKE_CD[i];
+        // These comparisons reject negative values, NaN, and infinity.
+        if (!(cd>=0.0 && cd<=std::numeric_limits<double>::max())) return false;
+        if (i>0 && cd<BRAKE_CD[i-1]) return false;
+    }
+    return true;
+}
+static_assert(BRAKE_CD.size()<=static_cast<std::size_t>(std::numeric_limits<int>::max()),
+              "Too many brake settings for integer commands");
+static_assert(validBrakeTable(),
+              "BRAKE_CD needs at least two finite, nonnegative, nondecreasing values, starting at zero");
 constexpr double GUST_PERIOD_S = 0.20;
 constexpr double GUST_TIME_CONSTANT_S = 0.60;
 constexpr double MAX_TIME_S = 60.0;
@@ -65,9 +85,9 @@ double density(double h) {
 }
 
 double totalCd(double level) {
-    level = std::clamp(level, 0.0, 9.0);
+    level = std::clamp(level, 0.0, static_cast<double>(cfg::MAX_BRAKE_INDEX));
     const int lo = static_cast<int>(level);
-    const int hi = std::min(lo + 1, 9);
+    const int hi = std::min(lo + 1, cfg::MAX_BRAKE_INDEX);
     return cfg::BASE_CD + cfg::BRAKE_CD[lo] +
         (level - lo) * (cfg::BRAKE_CD[hi] - cfg::BRAKE_CD[lo]);
 }
@@ -85,7 +105,7 @@ double predictedApogee(double h, double v, double cd,
 int commandIndex(double expected, double gain) {
     // Clamp before rounding so even a huge error cannot overflow an integer.
     return static_cast<int>(std::lround(std::clamp(
-        gain * (expected - cfg::TARGET_M), 0.0, 9.0)));
+        gain * (expected - cfg::TARGET_M), 0.0, static_cast<double>(cfg::MAX_BRAKE_INDEX))));
 }
 
 // Random targets updated on a fixed physical clock, independent of dt.
@@ -177,7 +197,7 @@ Result simulate(const Options& o, int mode, std::uint32_t seed,
     while (t < cfg::MAX_TIME_S) {
         if (t >= nextControl-1e-12) {
             prediction=predictedApogee(s.h,s.v,o.predictBase ? cfg::BASE_CD : totalCd(level));
-            command = mode==1 ? 0 : mode==2 ? 9 : commandIndex(prediction,o.gain);
+            command = mode==1 ? 0 : mode==2 ? cfg::MAX_BRAKE_INDEX : commandIndex(prediction,o.gain);
             nextControl = static_cast<double>(++tick)*cfg::CONTROL_PERIOD_S;
         }
         log();
@@ -235,12 +255,26 @@ void selfTest() {
         require(std::abs(invariant-predictedApogee(12,90,cd))<1e-7,
                 "analytical apogee invariant");
     }
-    require(commandIndex(100,0.2)==0 && commandIndex(10000,0.2)==9,
-            "controller saturation");
-    require(commandIndex(cfg::TARGET_M+7.6,0.2)==2,"nearest-index rounding");
+    require(commandIndex(100,0.2)==0 &&
+            commandIndex(1e12,0.2)==cfg::MAX_BRAKE_INDEX,"controller saturation");
+    for (int index=0;index<cfg::MAX_BRAKE_INDEX;++index) {
+        require(commandIndex(cfg::TARGET_M+index+0.49,1.0)==index &&
+                commandIndex(cfg::TARGET_M+index+0.51,1.0)==index+1,
+                "nearest-index rounding for each brake setting");
+        const double midpoint=cfg::BASE_CD+
+            0.5*(cfg::BRAKE_CD[index]+cfg::BRAKE_CD[index+1]);
+        require(std::abs(totalCd(index+0.5)-midpoint)<1e-12,
+                "interpolation between brake positions");
+    }
+    require(totalCd(-1)==totalCd(0) &&
+            totalCd(cfg::MAX_BRAKE_INDEX+1)==totalCd(cfg::MAX_BRAKE_INDEX),
+            "drag table clamps to first and last positions");
+    require(std::abs(cfg::SERVO_LEVELS_PER_S*cfg::SERVO_FULL_TRAVEL_S-
+                     cfg::MAX_BRAKE_INDEX)<1e-12,"constant full servo travel time");
     require(predictedApogee(12,-4,0.5)==12,"descending prediction guard");
     require(density(500)<density(0),"density decreases with height");
-    require(totalCd(0)==cfg::BASE_CD && totalCd(9)>totalCd(0),"drag table");
+    require(totalCd(0)==cfg::BASE_CD &&
+            totalCd(cfg::MAX_BRAKE_INDEX)==cfg::BASE_CD+cfg::BRAKE_CD.back(),"drag table");
     Options a; a.disturbances=false;
     const auto coarse=simulate(a,0,42);
     a.dt=0.0005;
@@ -253,7 +287,9 @@ void selfTest() {
     require(std::abs(simulate(a,0,42).apogee-first.apogee)<0.02,
             "gust simulation dt convergence");
     a.disturbances=false;
-    require(simulate(a,1,42).apogee>simulate(a,2,42).apogee,"braking authority");
+    const double retracted=simulate(a,1,42).apogee, maximum=simulate(a,2,42).apogee;
+    require(cfg::BRAKE_CD.back()>0 ? retracted>maximum : retracted==maximum,
+            "braking authority");
     std::cout << "All self-tests passed (analytic references, bounds, density, "
                  "repeatability, braking, and timestep convergence).\n";
 }
@@ -271,14 +307,16 @@ void detailedFlights(const Options& o) {
                   << " m^2; base Cd: " << cfg::BASE_CD << '\n'
                   << "Impulse: " << o.impulse << " N s; integration dt: " << o.dt
                   << " s; control period: " << cfg::CONTROL_PERIOD_S
-                  << " s; servo speed: " << cfg::SERVO_LEVELS_PER_S << " levels/s\n"
+                  << " s; servo speed: " << cfg::SERVO_LEVELS_PER_S << " levels/s; full travel: "
+                  << cfg::SERVO_FULL_TRAVEL_S << " s\n"
                   << "Predictor density: " << cfg::PREDICTOR_RHO
                   << " kg/m^3; predictor Cd: "
                   << (o.predictBase?"retracted":"current actual setting") << '\n'
                   << "Disturbances: " << (o.disturbances?"on":"off")
                   << "; gust interval: " << cfg::GUST_PERIOD_S
                   << " s; gust time constant: " << cfg::GUST_TIME_CONSTANT_S << " s\n"
-                  << "Extra brake Cd for settings 0..9:";
+                  << "Extra brake Cd for " << cfg::BRAKE_CD.size()
+                  << " settings (indices 0.." << cfg::MAX_BRAKE_INDEX << "):";
         for (double cd : cfg::BRAKE_CD) std::cout << ' ' << cd;
         std::cout << "\nEach table prints every integration step, plus the exact apex.\n"
                   << "Predicted apogee/error are held between controller updates.\n"
@@ -441,6 +479,9 @@ void describeBatch(const Options& o,int count,double tolerance) {
         << "\nTarget: " << cfg::TARGET_M << " m; flights per sample: " << count
         << "; tolerance: +/-" << tolerance << " m; base seed: " << o.seed
         << "; dt: " << o.dt << " s\n"
+        << "Brake settings: " << cfg::BRAKE_CD.size() << " (indices 0.."
+        << cfg::MAX_BRAKE_INDEX << "); command interval: " << cfg::CONTROL_PERIOD_S
+        << " s; full servo travel: " << cfg::SERVO_FULL_TRAVEL_S << " s\n"
         << "Predictor: " << (o.predictBase?"retracted Cd":"current-position Cd")
         << ", fixed nominal density " << cfg::PREDICTOR_RHO << " kg/m^3\n"
         << "Uniform per-flight variations: impulse 92..108% of " << o.impulse
